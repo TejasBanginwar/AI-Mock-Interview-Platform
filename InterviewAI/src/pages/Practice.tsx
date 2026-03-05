@@ -7,10 +7,51 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ArrowRight, Briefcase, Code, LineChart, Users } from "lucide-react";
 import { Link } from "react-router-dom";
+import ResumeUpload from "@/components/ResumeUpload";
 
 const Practice = () => {
   const [selectedRole, setSelectedRole] = useState("");
   const [selectedLevel, setSelectedLevel] = useState("");
+  const [generateStatus, setGenerateStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
+  const [generateError, setGenerateError] = useState<string | null>(null);
+  const [generateWarning, setGenerateWarning] = useState<string | null>(null);
+
+  const handleResumeParsed = async (resumeText: string) => {
+    if (!resumeText) return;
+    setGenerateStatus("loading");
+    setGenerateError(null);
+    setGenerateWarning(null);
+    try {
+      const res = await fetch("http://localhost:5000/api/generate-questions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ resume_text: resumeText }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = data?.error || "Failed to generate questions";
+        setGenerateStatus("error");
+        setGenerateError(msg);
+        return;
+      }
+      const questions = Array.isArray(data?.questions) ? data.questions : [];
+      if (questions.length > 0) {
+        localStorage.setItem("interviewQuestions", JSON.stringify(questions));
+        setGenerateStatus("success");
+        if (typeof data?.warning === "string" && data.warning) {
+          setGenerateWarning(data.warning);
+        }
+      } else {
+        setGenerateStatus("error");
+        setGenerateError("No questions returned from API.");
+      }
+    } catch (err: unknown) {
+      setGenerateStatus("error");
+      setGenerateError(err instanceof Error ? err.message : "Failed to generate questions");
+    }
+  };
 
   const interviewTypes = [
     {
@@ -76,6 +117,29 @@ const Practice = () => {
               </Card>
             ))}
           </div>
+
+          <Card className="p-8 border border-border mb-8">
+            <h2 className="text-2xl font-bold text-card-foreground mb-6">
+              Upload Your Resume (Beta)
+            </h2>
+            <ResumeUpload onParsed={handleResumeParsed} />
+            {generateStatus === "loading" && (
+              <p className="mt-4 text-sm text-muted-foreground">Generating questions from your resume…</p>
+            )}
+            {generateStatus === "success" && (
+              <p className="mt-4 text-sm text-green-600 dark:text-green-400">
+                Questions generated. Go to the Interview page to start.
+              </p>
+            )}
+            {generateStatus === "success" && generateWarning && (
+              <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                Using fallback questions: {generateWarning}
+              </p>
+            )}
+            {generateStatus === "error" && generateError && (
+              <p className="mt-4 text-sm text-red-500">{generateError}</p>
+            )}
+          </Card>
 
           <Card className="p-8 border border-border">
             <h2 className="text-2xl font-bold text-card-foreground mb-6">

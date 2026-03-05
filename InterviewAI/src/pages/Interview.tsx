@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Navigation from "@/components/Navigation";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -13,22 +13,134 @@ const Interview = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [currentQuestion, setCurrentQuestion] = useState(0);
   const [answer, setAnswer] = useState("");
+  const [questions, setQuestions] = useState<string[]>([]);
+  const [answers, setAnswers] = useState<string[]>([]);
+  const [isProcessingAudio, setIsProcessingAudio] = useState(false);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
 
-  const questions = [
-    "Tell me about yourself and your professional background.",
-    "What are your greatest strengths and how do they apply to this role?",
-    "Describe a challenging project you worked on and how you overcame obstacles.",
-    "Where do you see yourself in 5 years?",
-    "Why are you interested in this position and our company?",
-  ];
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("interviewQuestions");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setQuestions(parsed);
+        }
+      }
+    } catch {
+      // ignore parse errors and fall back to defaults
+    }
+  }, []);
 
-  const progress = ((currentQuestion + 1) / questions.length) * 100;
+  const progress = questions.length > 0 ? ((currentQuestion + 1) / questions.length) * 100 : 0;
+
+  // Keep answers array in sync with questions length
+  useEffect(() => {
+    if (questions.length === 0) return;
+    setAnswers((prev) => {
+      const next = [...prev];
+      if (next.length < questions.length) {
+        for (let i = next.length; i < questions.length; i++) {
+          next[i] = next[i] ?? "";
+        }
+      }
+      return next.slice(0, questions.length);
+    });
+  }, [questions]);
+
+  // Persist answers so Results page can read them
+  useEffect(() => {
+    if (answers.length > 0) {
+      localStorage.setItem("interviewAnswers", JSON.stringify(answers));
+    }
+  }, [answers]);
+
+  const updateCurrentAnswer = (text: string) => {
+    setAnswer(text);
+    setAnswers((prev) => {
+      const next = [...prev];
+      next[currentQuestion] = text;
+      return next;
+    });
+  };
 
   const handleNext = () => {
     if (currentQuestion < questions.length - 1) {
       setCurrentQuestion(currentQuestion + 1);
-      setAnswer("");
+      setAnswer(answers[currentQuestion + 1] || "");
       setIsRecording(false);
+      setFeedbackError(null);
+    }
+  };
+
+  const handleToggleRecording = async () => {
+    if (!questions.length) return;
+
+    // Stop recording
+    if (isRecording && mediaRecorder) {
+      mediaRecorder.stop();
+      setIsRecording(false);
+      return;
+    }
+
+    // Start recording
+    try {
+      setFeedbackError(null);
+      setAnswer("");
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks: BlobPart[] = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        await sendAudioForEvaluation(blob);
+      };
+
+      setMediaRecorder(recorder);
+      setIsRecording(true);
+      recorder.start();
+    } catch (err) {
+      console.error("Failed to start recording", err);
+      setFeedbackError("Failed to access microphone. Please check browser permissions.");
+    }
+  };
+
+  const sendAudioForEvaluation = async (blob: Blob) => {
+    if (!questions.length) return;
+    setIsProcessingAudio(true);
+    try {
+      const formData = new FormData();
+      formData.append("audio", blob, "answer.webm");
+      formData.append("question", questions[currentQuestion]);
+
+      const res = await fetch("http://localhost:5000/api/evaluate-answer-audio", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setFeedbackError(data?.error || "Failed to transcribe answer.");
+        if (data?.transcript) {
+          updateCurrentAnswer(data.transcript);
+        }
+        return;
+      }
+      if (data?.transcript) {
+        updateCurrentAnswer(data.transcript);
+      }
+    } catch (err: any) {
+      setFeedbackError(err?.message || "Failed to send audio for evaluation.");
+    } finally {
+      setIsProcessingAudio(false);
     }
   };
 
@@ -43,6 +155,17 @@ const Interview = () => {
             <TabSwitchWarning maxWarnings={5} />
           </div>
 
+          {questions.length === 0 ? (
+            <Card className="p-8 border border-border">
+              <p className="text-muted-foreground mb-4">
+                No interview questions yet. Upload your resume on the Practice page to generate questions (from Gemini or fallback).
+              </p>
+              <Link to="/practice">
+                <Button variant="hero">Go to Practice</Button>
+              </Link>
+            </Card>
+          ) : (
+          <>
           <div className="mb-8">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-2xl font-bold text-foreground">
@@ -78,7 +201,7 @@ const Interview = () => {
               <Textarea
                 placeholder="Type your answer here or click the microphone to record..."
                 value={answer}
-                onChange={(e) => setAnswer(e.target.value)}
+                onChange={(e) => updateCurrentAnswer(e.target.value)}
                 className="min-h-[200px] resize-none"
               />
 
@@ -86,8 +209,9 @@ const Interview = () => {
                 <Button
                   variant={isRecording ? "destructive" : "outline"}
                   size="lg"
-                  onClick={() => setIsRecording(!isRecording)}
+                  onClick={handleToggleRecording}
                   className="flex-1"
+                  disabled={isProcessingAudio}
                 >
                   {isRecording ? (
                     <>
@@ -97,11 +221,23 @@ const Interview = () => {
                   ) : (
                     <>
                       <Mic className="w-5 h-5 mr-2" />
-                      Start Recording
+                      {isProcessingAudio ? "Processing..." : "Start Recording"}
                     </>
                   )}
                 </Button>
               </div>
+
+              {isProcessingAudio && (
+                <p className="text-sm text-muted-foreground">
+                  Transcribing your answer and generating feedback…
+                </p>
+              )}
+
+              {feedbackError && (
+                <p className="text-sm text-red-500">
+                  {feedbackError}
+                </p>
+              )}
             </div>
           </Card>
 
@@ -151,6 +287,8 @@ const Interview = () => {
               <li>• Show enthusiasm and confidence</li>
             </ul>
           </div>
+          </>
+          )}
         </div>
       </div>
     </div>
