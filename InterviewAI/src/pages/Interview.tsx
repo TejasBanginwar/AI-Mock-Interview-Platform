@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Navigation from "@/components/Navigation";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -15,9 +15,22 @@ const Interview = () => {
   const [answer, setAnswer] = useState("");
   const [questions, setQuestions] = useState<string[]>([]);
   const [answers, setAnswers] = useState<string[]>([]);
-  const [isProcessingAudio, setIsProcessingAudio] = useState(false);
+  /** Short upload to /api/save-answer-audio (no Whisper during interview). */
+  const [isSavingAudio, setIsSavingAudio] = useState(false);
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
+  /** One voice capture per question; after stop, mic stays off until next question. */
+  const [recordingLocked, setRecordingLocked] = useState<boolean[]>([]);
+  const questionIndexWhenRecordingStarted = useRef(0);
+
+  const getInterviewSessionId = (): string => {
+    let id = localStorage.getItem("interviewSessionId");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("interviewSessionId", id);
+    }
+    return id;
+  };
 
   useEffect(() => {
     try {
@@ -44,6 +57,17 @@ const Interview = () => {
         for (let i = next.length; i < questions.length; i++) {
           next[i] = next[i] ?? "";
         }
+      }
+      return next.slice(0, questions.length);
+    });
+  }, [questions]);
+
+  useEffect(() => {
+    if (questions.length === 0) return;
+    setRecordingLocked((prev) => {
+      const next = [...prev];
+      for (let i = next.length; i < questions.length; i++) {
+        next[i] = false;
       }
       return next.slice(0, questions.length);
     });
@@ -76,6 +100,7 @@ const Interview = () => {
 
   const handleToggleRecording = async () => {
     if (!questions.length) return;
+    if (recordingLocked[currentQuestion]) return;
 
     // Stop recording
     if (isRecording && mediaRecorder) {
@@ -87,7 +112,7 @@ const Interview = () => {
     // Start recording
     try {
       setFeedbackError(null);
-      setAnswer("");
+      questionIndexWhenRecordingStarted.current = currentQuestion;
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const recorder = new MediaRecorder(stream);
@@ -102,7 +127,14 @@ const Interview = () => {
       recorder.onstop = async () => {
         stream.getTracks().forEach((track) => track.stop());
         const blob = new Blob(chunks, { type: "audio/webm" });
-        await sendAudioForEvaluation(blob);
+        const qIdx = questionIndexWhenRecordingStarted.current;
+        setRecordingLocked((prev) => {
+          const next = [...prev];
+          while (next.length <= qIdx) next.push(false);
+          next[qIdx] = true;
+          return next;
+        });
+        await saveAnswerAudio(blob, qIdx);
       };
 
       setMediaRecorder(recorder);
@@ -114,33 +146,29 @@ const Interview = () => {
     }
   };
 
-  const sendAudioForEvaluation = async (blob: Blob) => {
+  const saveAnswerAudio = async (blob: Blob, questionIndex: number) => {
     if (!questions.length) return;
-    setIsProcessingAudio(true);
+    setIsSavingAudio(true);
     try {
       const formData = new FormData();
       formData.append("audio", blob, "answer.webm");
-      formData.append("question", questions[currentQuestion]);
+      formData.append("session_id", getInterviewSessionId());
+      formData.append("question_index", String(questionIndex));
 
-      const res = await fetch("http://localhost:5000/api/evaluate-answer-audio", {
+      const res = await fetch("http://localhost:5000/api/save-answer-audio", {
         method: "POST",
         body: formData,
       });
       const data = await res.json();
       if (!res.ok) {
-        setFeedbackError(data?.error || "Failed to transcribe answer.");
-        if (data?.transcript) {
-          updateCurrentAnswer(data.transcript);
-        }
+        setFeedbackError(data?.error || "Failed to save recording.");
         return;
       }
-      if (data?.transcript) {
-        updateCurrentAnswer(data.transcript);
-      }
-    } catch (err: any) {
-      setFeedbackError(err?.message || "Failed to send audio for evaluation.");
+      setFeedbackError(null);
+    } catch (err: unknown) {
+      setFeedbackError(err instanceof Error ? err.message : "Failed to save recording.");
     } finally {
-      setIsProcessingAudio(false);
+      setIsSavingAudio(false);
     }
   };
 
@@ -193,7 +221,7 @@ const Interview = () => {
                 {questions[currentQuestion]}
               </h3>
               <p className="text-muted-foreground">
-                Take your time to think about your answer. You can type or use voice recording.
+                Type your answer and/or record voice. Recordings are saved immediately; speech-to-text runs after you finish the interview.
               </p>
             </div>
 
@@ -211,25 +239,36 @@ const Interview = () => {
                   size="lg"
                   onClick={handleToggleRecording}
                   className="flex-1"
-                  disabled={isProcessingAudio}
+                  disabled={isSavingAudio || (!!recordingLocked[currentQuestion] && !isRecording)}
                 >
                   {isRecording ? (
                     <>
                       <MicOff className="w-5 h-5 mr-2" />
                       Stop Recording
                     </>
+                  ) : recordingLocked[currentQuestion] ? (
+                    <>
+                      <Mic className="w-5 h-5 mr-2" />
+                      Voice answer saved
+                    </>
                   ) : (
                     <>
                       <Mic className="w-5 h-5 mr-2" />
-                      {isProcessingAudio ? "Processing..." : "Start Recording"}
+                      {isSavingAudio ? "Saving…" : "Start Recording"}
                     </>
                   )}
                 </Button>
               </div>
 
-              {isProcessingAudio && (
+              {isSavingAudio && (
                 <p className="text-sm text-muted-foreground">
-                  Transcribing your answer and generating feedback…
+                  Uploading recording…
+                </p>
+              )}
+
+              {recordingLocked[currentQuestion] && !isRecording && !isSavingAudio && (
+                <p className="text-sm text-muted-foreground">
+                  Recording stored. It will be transcribed with Whisper when you complete the interview.
                 </p>
               )}
 
@@ -258,7 +297,7 @@ const Interview = () => {
                   size="lg"
                   onClick={handleNext}
                   className="flex-1"
-                  disabled={!answer && !isRecording}
+                  disabled={!answer.trim() && !recordingLocked[currentQuestion] && !isRecording}
                 >
                   Next Question
                 </Button>
@@ -269,7 +308,7 @@ const Interview = () => {
                   variant="hero"
                   size="lg"
                   className="w-full"
-                  disabled={!answer && !isRecording}
+                  disabled={!answer.trim() && !recordingLocked[currentQuestion] && !isRecording}
                 >
                   <Check className="w-5 h-5 mr-2" />
                   Complete Interview

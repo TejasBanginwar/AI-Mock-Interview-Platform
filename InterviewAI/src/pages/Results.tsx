@@ -24,23 +24,18 @@ const Results = () => {
           return;
         }
 
-        const qa = questions.map((q, idx) => ({
-          question: q,
-          answer: (answers[idx] || "").trim(),
-        })).filter(item => item.answer);
+        const sessionId = localStorage.getItem("interviewSessionId");
 
-        if (qa.length === 0) {
-          setError("No recorded answers were found for this interview.");
-          setLoading(false);
-          return;
-        }
-
-        const res = await fetch("http://localhost:5000/api/evaluate-interview-report", {
+        const res = await fetch("http://localhost:5000/api/interview-report-transcribe", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ qa }),
+          body: JSON.stringify({
+            session_id: sessionId || undefined,
+            questions,
+            typed_answers: answers,
+          }),
         });
         const data = await res.json();
         if (!res.ok) {
@@ -80,7 +75,7 @@ const Results = () => {
           <Card className="p-8 mb-8 border border-border">
             {loading && (
               <p className="text-muted-foreground">
-                Generating your report from all answers…
+                Transcribing recordings with Whisper (if any) and generating your report… This may take a few minutes.
               </p>
             )}
             {!loading && error && (

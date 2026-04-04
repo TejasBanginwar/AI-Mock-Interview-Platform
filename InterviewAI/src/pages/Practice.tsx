@@ -38,6 +38,7 @@ const Practice = () => {
       }
       const questions = Array.isArray(data?.questions) ? data.questions : [];
       if (questions.length > 0) {
+        localStorage.setItem("interviewSessionId", crypto.randomUUID());
         localStorage.setItem("interviewQuestions", JSON.stringify(questions));
         setGenerateStatus("success");
         if (typeof data?.warning === "string" && data.warning) {

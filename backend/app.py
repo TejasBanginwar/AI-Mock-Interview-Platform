@@ -1,3 +1,5 @@
+from typing import Optional, Tuple
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -11,9 +13,21 @@ from dotenv import load_dotenv
 import tempfile
 import re
 import json
+import subprocess
+import uuid
+import shutil
 import docx
 import pdfplumber
 import requests
+
+try:
+    import librosa
+    LIBROSA_AVAILABLE = True
+except Exception as e:
+    print("WARNING: librosa is not available; audio metrics will be skipped.")
+    print(f"librosa error: {e}")
+    librosa = None
+    LIBROSA_AVAILABLE = False
 
 try:
     import whisper
@@ -44,6 +58,254 @@ except ImportError as e:
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend
+
+# Per-interview answer audio (WAV for librosa: PCM 16-bit mono, 22050 Hz)
+ANSWER_AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "answer_audio")
+
+
+def _ensure_safe_session_id(raw: Optional[str]) -> Optional[str]:
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        u = uuid.UUID(raw.strip())
+        return str(u)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _webm_to_wav_librosa_friendly(webm_path: str, wav_path: str) -> bool:
+    """Convert browser WebM/Opus to WAV suitable for librosa.load (pcm_s16le, mono, 22050 Hz)."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                webm_path,
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "22050",
+                "-ac",
+                "1",
+                wav_path,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        return os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _save_answer_audio_wav(webm_bytes: bytes, session_id: str, question_index: int) -> Tuple[Optional[str], Optional[str]]:
+    """Write WebM to temp, convert to WAV, return (relative_path_from_backend_dir, error_message)."""
+    os.makedirs(ANSWER_AUDIO_DIR, exist_ok=True)
+    session_dir = os.path.join(ANSWER_AUDIO_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    safe_idx = max(0, int(question_index))
+    wav_name = f"question_{safe_idx:03d}.wav"
+    wav_path = os.path.join(session_dir, wav_name)
+
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(webm_bytes)
+        webm_path = tmp.name
+
+    try:
+        if _webm_to_wav_librosa_friendly(webm_path, wav_path):
+            rel = os.path.join("answer_audio", session_id, wav_name)
+            return rel.replace("\\", "/"), None
+        # Fallback: keep original container if ffmpeg missing (less ideal for librosa)
+        fallback_name = f"question_{safe_idx:03d}.webm"
+        fallback_path = os.path.join(session_dir, fallback_name)
+        shutil.copy2(webm_path, fallback_path)
+        rel = os.path.join("answer_audio", session_id, fallback_name)
+        return rel.replace("\\", "/"), "ffmpeg unavailable or conversion failed; stored as WebM (install ffmpeg for WAV)."
+    finally:
+        try:
+            os.remove(webm_path)
+        except OSError:
+            pass
+
+
+def _answer_audio_path_for_index(session_id: str, question_index: int) -> Optional[str]:
+    """Return path to WAV or WebM if saved for this question."""
+    session_dir = os.path.join(ANSWER_AUDIO_DIR, session_id)
+    for ext in (".wav", ".webm"):
+        p = os.path.join(session_dir, f"question_{question_index:03d}{ext}")
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
+            return p
+    return None
+
+
+def _analyze_answer_audio(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Compute librosa-based metrics for one answer audio file."""
+    if not LIBROSA_AVAILABLE or librosa is None:
+        return None, "librosa is not installed on the server."
+    try:
+        y, sr = librosa.load(path, sr=None, mono=True)
+        if y is None or len(y) == 0:
+            return None, "Empty audio."
+
+        # Basic energy
+        rms = librosa.feature.rms(y=y)[0]
+        mean_rms = float(rms.mean()) if rms.size else 0.0
+
+        # Pause count: split into non-silent intervals then count gaps.
+        intervals = librosa.effects.split(y, top_db=30)
+        pause_count = max(0, len(intervals) - 1)
+
+        # Speech consistency: stability of energy across speech segments.
+        # Use coefficient of variation of RMS inside "speech" intervals.
+        if len(intervals) > 0 and rms.size:
+            frame_len = 2048
+            hop_len = 512
+            speech_rms_vals = []
+            for s, e in intervals:
+                f0 = int(max(0, (s - frame_len) // hop_len))
+                f1 = int(min(len(rms), (e // hop_len) + 1))
+                if f1 > f0:
+                    speech_rms_vals.extend(rms[f0:f1].tolist())
+            if speech_rms_vals:
+                arr = np.array(speech_rms_vals, dtype=np.float32)
+                mu = float(arr.mean())
+                sigma = float(arr.std())
+                consistency = float(1.0 - (sigma / (mu + 1e-8)))
+            else:
+                consistency = 0.0
+        else:
+            consistency = 0.0
+
+        # Normalize to a 0-100 confidence score with simple heuristics.
+        # - Consistency: higher is better (cap [0, 1])
+        # - Pauses: fewer is better (soft penalty)
+        # - Energy: moderate energy is better; too low suggests quiet/unclear speech.
+        cons01 = max(0.0, min(1.0, consistency))
+        pause_penalty = min(1.0, pause_count / 8.0)  # ~8+ pauses → max penalty
+        energy_score = max(0.0, min(1.0, mean_rms / 0.08))  # heuristic for normalized waveform
+        confidence = (0.55 * cons01 + 0.30 * energy_score + 0.15 * (1.0 - pause_penalty)) * 100.0
+
+        return {
+            "speech_consistency": cons01,
+            "pause_count": int(pause_count),
+            "mean_energy": mean_rms,
+            "confidence_score": float(max(0.0, min(100.0, confidence))),
+            "duration_sec": float(len(y) / float(sr)) if sr else 0.0,
+        }, None
+    except Exception as e:
+        return None, f"Failed to analyze audio: {e}"
+
+
+def _average_audio_metrics(session_id: Optional[str], n_questions: int) -> Tuple[Optional[dict], Optional[str]]:
+    """Average metrics across all recorded answers in a session."""
+    if not session_id:
+        return None, None
+    metrics = []
+    for i in range(n_questions):
+        p = _answer_audio_path_for_index(session_id, i)
+        if not p:
+            continue
+        m, err = _analyze_answer_audio(p)
+        if err:
+            return None, err
+        if m:
+            metrics.append(m)
+
+    if not metrics:
+        return None, None
+
+    avg = {
+        "answers_analyzed": len(metrics),
+        "avg_speech_consistency": float(np.mean([m["speech_consistency"] for m in metrics])),
+        "avg_pause_count": float(np.mean([m["pause_count"] for m in metrics])),
+        "avg_mean_energy": float(np.mean([m["mean_energy"] for m in metrics])),
+        "avg_confidence_score": float(np.mean([m["confidence_score"] for m in metrics])),
+        "total_audio_sec": float(np.sum([m["duration_sec"] for m in metrics])),
+    }
+    return avg, None
+
+
+def _merge_answers_with_session_audio(
+    session_id: Optional[str],
+    questions: list,
+    typed_answers: list,
+) -> Tuple[list, Optional[str]]:
+    """For each question index: if audio file exists, Whisper transcribe; else use typed answer."""
+    n = len(questions)
+    typed = list(typed_answers) if isinstance(typed_answers, list) else []
+    while len(typed) < n:
+        typed.append("")
+    merged = []
+    for i in range(n):
+        audio_path = None
+        if session_id:
+            audio_path = _answer_audio_path_for_index(session_id, i)
+        if audio_path:
+            if not WHISPER_AVAILABLE or whisper_model is None:
+                return [], "Speech-to-text (Whisper) is required for recorded answers but is not available on the server."
+            try:
+                stt_result = whisper_model.transcribe(audio_path, language="en", fp16=True)
+                text = (stt_result.get("text") or "").strip()
+            except Exception as e:
+                return [], f"Failed to transcribe audio for question {i + 1}: {e}"
+            merged.append(text if text else (typed[i] or "").strip())
+        else:
+            merged.append((typed[i] or "").strip())
+    return merged, None
+
+
+def _make_report_from_qa(qa_list):
+    """Build Gemini report from list of {question, answer}. Returns (report, None) or (None, (msg, code))."""
+    if not isinstance(qa_list, list) or not qa_list:
+        return None, ("No questions/answers provided", 400)
+
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
+        return None, ("Gemini API key not configured.", 500)
+
+    numbered_sections = []
+    index = 1
+    for item in qa_list:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        if not q or not a:
+            continue
+        section = f"{index}. Question: {q}\nAnswer: {a}\n"
+        numbered_sections.append(section)
+        index += 1
+
+    if not numbered_sections:
+        return None, ("No valid question/answer pairs provided.", 400)
+
+    qa_block = "\n\n".join(numbered_sections)
+
+    prompt = (
+        "You are an experienced interview coach. Below are numbered interview questions and the candidate's answers.\n"
+        "For EACH numbered question/answer, write about five lines of feedback explaining how the answer was and what can be improved.\n"
+        "Structure your response as numbered sections matching the questions (1., 2., etc.). Plain text only, no JSON or bullet lists.\n\n"
+        f"{qa_block}\n"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
+    try:
+        resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=90)
+        data = resp.json()
+        if not resp.ok:
+            err_msg = data.get("error", {}).get("message", data.get("error", resp.text))
+            return None, (f"Gemini API error: {err_msg}", resp.status_code)
+
+        text = _extract_gemini_text(data)
+        if not text:
+            return None, ("Empty response from Gemini.", 500)
+
+        return text.strip(), None
+    except Exception as e:
+        return None, (f"Failed to generate interview report: {e}", 500)
+
 
 # Initialize MediaPipe Face Detection
 face_detection = None
@@ -253,100 +515,104 @@ def _evaluate_answer_with_gemini(question: str, answer_text: str):
         return None, f"Failed to call Gemini: {e}"
 
 
-@app.route('/api/evaluate-answer-audio', methods=['POST'])
-def evaluate_answer_audio():
-    """Accepts an audio recording and question, transcribes it, and returns only the transcript.
+@app.route('/api/save-answer-audio', methods=['POST'])
+def save_answer_audio():
+    """Save recorded WebM as WAV (or WebM fallback) per session/question. No Whisper — fast.
 
-    Gemini feedback is generated later in a single report for all answers.
+    Form: audio (file), session_id (UUID), question_index (int).
     """
-    if not WHISPER_AVAILABLE or whisper_model is None:
-        return jsonify({'error': 'Whisper speech-to-text is not available on the server.'}), 500
-
     if 'audio' not in request.files:
         return jsonify({'error': 'No audio file uploaded'}), 400
 
-    # Question is optional here; we just transcribe the audio
     audio_file = request.files['audio']
-    # Save to a temporary file for Whisper/ffmpeg to read
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-        tmp.write(audio_file.read())
-        tmp_path = tmp.name
+    raw_bytes = audio_file.read()
 
-    try:
-        # fp16=False for CPU-only environments
-        stt_result = whisper_model.transcribe(tmp_path, language="en", fp16=True)
-    except Exception as e:
-        os.remove(tmp_path)
-        return jsonify({'error': f'Failed to transcribe audio with Whisper: {e}'}), 500
-    finally:
+    session_id = _ensure_safe_session_id(request.form.get("session_id"))
+    question_index_raw = request.form.get("question_index")
+    question_index: Optional[int] = None
+    if question_index_raw is not None and str(question_index_raw).strip() != "":
         try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+            question_index = int(question_index_raw)
+        except ValueError:
+            question_index = None
 
-    transcript = (stt_result.get("text") or "").strip()
+    if session_id is None or question_index is None:
+        return jsonify({'error': 'Valid session_id (UUID) and question_index are required.'}), 400
 
-    if not transcript:
-        return jsonify({'error': 'Could not transcribe audio to text.'}), 500
+    saved_audio_path, storage_warning = _save_answer_audio_wav(raw_bytes, session_id, question_index)
+    if not saved_audio_path:
+        return jsonify({'error': 'Failed to save audio.'}), 500
 
-    # Only return transcript; feedback is generated later in a single report
-    return jsonify({'transcript': transcript})
+    out = {'saved': True, 'saved_audio_path': saved_audio_path}
+    if storage_warning:
+        out['storage_warning'] = storage_warning
+    return jsonify(out)
+
+
+@app.route('/api/interview-report-transcribe', methods=['POST'])
+def interview_report_transcribe():
+    """After interview: Whisper transcribe all saved answer audio, merge with typed answers, return Gemini report.
+
+    JSON: session_id (optional UUID), questions (list of str), typed_answers (list of str, same length).
+    """
+    data = request.get_json() or {}
+    questions = data.get("questions")
+    typed_answers = data.get("typed_answers") or []
+    session_id = _ensure_safe_session_id(data.get("session_id"))
+
+    if not isinstance(questions, list) or not questions:
+        return jsonify({'error': 'No questions provided.'}), 400
+
+    merged, merge_err = _merge_answers_with_session_audio(session_id, questions, typed_answers)
+    if merge_err:
+        return jsonify({'error': merge_err}), 500
+
+    qa_list = []
+    for i, q in enumerate(questions):
+        qs = (q or "").strip()
+        if not qs:
+            continue
+        ans = merged[i] if i < len(merged) else ""
+        if not (ans or "").strip():
+            continue
+        qa_list.append({"question": qs, "answer": ans.strip()})
+
+    if not qa_list:
+        return jsonify({'error': 'No answers to report (add typed text or record voice for at least one question).'}), 400
+
+    audio_avg, audio_err = _average_audio_metrics(session_id, len(questions))
+    if audio_err:
+        return jsonify({'error': audio_err}), 500
+
+    report, err = _make_report_from_qa(qa_list)
+    if err:
+        return jsonify({'error': err[0]}), err[1]
+
+    if audio_avg:
+        summary = (
+            "Audio Analysis Summary (averaged across all recorded answers)\n"
+            f"- Answers analyzed: {audio_avg['answers_analyzed']}\n"
+            f"- Confidence score: {audio_avg['avg_confidence_score']:.1f}/100\n"
+            f"- Speech consistency: {audio_avg['avg_speech_consistency']:.3f}\n"
+            f"- Pause count: {audio_avg['avg_pause_count']:.2f}\n"
+            f"- Energy (mean RMS): {audio_avg['avg_mean_energy']:.5f}\n"
+        ).strip()
+        report = summary + "\n\n" + report
+
+    return jsonify({"report": report, "answers_used": merged, "audio_metrics_avg": audio_avg})
 
 
 @app.route('/api/evaluate-interview-report', methods=['POST'])
 def evaluate_interview_report():
-    """Generate a consolidated feedback report for all questions and answers."""
+    """Generate a consolidated feedback report for all questions and answers (pre-built qa list)."""
     data = request.get_json() or {}
     qa_list = data.get('qa', [])
 
-    if not isinstance(qa_list, list) or not qa_list:
-        return jsonify({'error': 'No questions/answers provided'}), 400
+    report, err = _make_report_from_qa(qa_list)
+    if err:
+        return jsonify({'error': err[0]}), err[1]
 
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
-        return jsonify({'error': 'Gemini API key not configured.'}), 500
-
-    numbered_sections = []
-    index = 1
-    for item in qa_list:
-        q = (item.get('question') or '').strip()
-        a = (item.get('answer') or '').strip()
-        if not q or not a:
-            continue
-        section = f"{index}. Question: {q}\nAnswer: {a}\n"
-        numbered_sections.append(section)
-        index += 1
-
-    if not numbered_sections:
-        return jsonify({'error': 'No valid question/answer pairs provided.'}), 400
-
-    qa_block = "\n\n".join(numbered_sections)
-
-    prompt = (
-        "You are an experienced interview coach. Below are numbered interview questions and the candidate's answers.\n"
-        "For EACH numbered question/answer, write about five lines of feedback explaining how the answer was and what can be improved.\n"
-        "Structure your response as numbered sections matching the questions (1., 2., etc.). Plain text only, no JSON or bullet lists.\n\n"
-        f"{qa_block}\n"
-    )
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
-
-    headers = {"x-goog-api-key": GEMINI_API_KEY}
-    try:
-        resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=90)
-        data = resp.json()
-        if not resp.ok:
-            err_msg = data.get("error", {}).get("message", data.get("error", resp.text))
-            return jsonify({'error': f'Gemini API error: {err_msg}'}), resp.status_code
-
-        text = _extract_gemini_text(data)
-        if not text:
-            return jsonify({'error': 'Empty response from Gemini.'}), 500
-
-        return jsonify({'report': text.strip()})
-    except Exception as e:
-        return jsonify({'error': f'Failed to generate interview report: {e}'}), 500
+    return jsonify({'report': report})
 
 
 @app.route('/api/generate-questions', methods=['POST'])
