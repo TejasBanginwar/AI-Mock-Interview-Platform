@@ -3,8 +3,11 @@ import { Button } from "@/components/ui/button";
 
 export default function ResumeUpload({
   onParsed,
+  disabled = false,
 }: {
   onParsed: (text: string) => void | Promise<void>;
+  /** When true, user cannot upload (e.g. interview type not chosen yet). */
+  disabled?: boolean;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -12,7 +15,7 @@ export default function ResumeUpload({
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || disabled) return;
     setUploading(true);
     setError(null);
     const formData = new FormData();
@@ -50,11 +53,11 @@ export default function ResumeUpload({
         ref={fileInputRef}
         onChange={handleFileChange}
         className="block w-full text-sm text-muted-foreground"
-        disabled={uploading}
+        disabled={uploading || disabled}
       />
       <Button
         onClick={() => fileInputRef.current?.click()}
-        disabled={uploading}
+        disabled={uploading || disabled}
         variant="outline"
       >
         {uploading ? "Uploading & generating questions…" : "Upload Resume"}

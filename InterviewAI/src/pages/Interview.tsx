@@ -22,6 +22,7 @@ const Interview = () => {
   /** One voice capture per question; after stop, mic stays off until next question. */
   const [recordingLocked, setRecordingLocked] = useState<boolean[]>([]);
   const questionIndexWhenRecordingStarted = useRef(0);
+  const [interviewTypeLabel, setInterviewTypeLabel] = useState<string | null>(null);
 
   const getInterviewSessionId = (): string => {
     let id = localStorage.getItem("interviewSessionId");
@@ -44,6 +45,7 @@ const Interview = () => {
     } catch {
       // ignore parse errors and fall back to defaults
     }
+    setInterviewTypeLabel(localStorage.getItem("interviewTypeLabel"));
   }, []);
 
   const progress = questions.length > 0 ? ((currentQuestion + 1) / questions.length) * 100 : 0;
@@ -195,11 +197,16 @@ const Interview = () => {
           ) : (
           <>
           <div className="mb-8">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-2xl font-bold text-foreground">
-                Mock Interview Session
-              </h2>
-              <span className="text-muted-foreground">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4">
+              <div>
+                <h2 className="text-2xl font-bold text-foreground">
+                  Mock Interview Session
+                </h2>
+                {interviewTypeLabel && (
+                  <p className="text-sm text-muted-foreground mt-1">{interviewTypeLabel}</p>
+                )}
+              </div>
+              <span className="text-muted-foreground shrink-0">
                 Question {currentQuestion + 1} of {questions.length}
               </span>
             </div>

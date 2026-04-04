@@ -462,22 +462,115 @@ def _extract_gemini_text(result):
         return None
 
 
-def _fallback_questions(resume_text: str):
+def _fallback_questions(resume_text: str, interview_type: str = "general"):
     """Generate basic fallback questions if Gemini API is unavailable."""
-    # Keep it simple and generic but still reasonable
-    base = [
-        "Can you walk me through the key highlights of your resume?",
-        "What project are you most proud of from your recent experience, and why?",
-        "Tell me about a challenging problem you solved and how you approached it.",
-        "Describe a time you had to collaborate with others to achieve a goal.",
-        "What technical or domain skills do you use most frequently in your work?",
+    it = (interview_type or "general").lower().strip()
+    common_tail = [
         "Tell me about a time you received critical feedback and how you responded.",
         "Describe a situation where you had to learn something quickly to complete a task.",
         "How do you prioritize your tasks when you have multiple deadlines?",
         "What kind of role or responsibilities are you looking for next?",
         "Why do you think you would be a good fit for this position?",
     ]
+    if it == "technical":
+        head = [
+            "Walk me through a system or module you built that you are most proud of.",
+            "How do you approach debugging a complex production issue?",
+            "Describe your experience with code review and maintaining quality at scale.",
+            "Explain a trade-off you made between performance and maintainability.",
+            "How do you stay current with tools, languages, or frameworks relevant to your stack?",
+        ]
+        return head + common_tail
+    if it == "product_management":
+        head = [
+            "How do you prioritize features when stakeholders disagree?",
+            "Describe a product decision you made using data and user research.",
+            "Tell me about a product that failed or underperformed and what you learned.",
+            "How do you align engineering and design on roadmap and scope?",
+            "What metrics do you track to measure product success?",
+        ]
+        return head + common_tail
+    if it == "leadership":
+        head = [
+            "Describe how you build psychological safety on a team you lead or influenced.",
+            "Tell me about a difficult personnel situation and how you handled it.",
+            "How do you delegate while still owning outcomes?",
+            "Describe a time you had to drive alignment across multiple teams or departments.",
+            "How do you develop junior team members?",
+        ]
+        return head + common_tail
+    if it == "custom":
+        head = [
+            "Based on your stated target role, what is the biggest gap you are working to close?",
+            "How does your recent experience prepare you for the responsibilities you want next?",
+            "What would you accomplish in the first 90 days if you joined your target company?",
+            "Describe a project that best demonstrates fit for your target role.",
+            "What constraints (team size, budget, timeline) have shaped your biggest wins?",
+        ]
+        return head + common_tail
+    # general (default)
+    base = [
+        "Can you walk me through the key highlights of your resume?",
+        "What project are you most proud of from your recent experience, and why?",
+        "Tell me about a challenging problem you solved and how you approached it.",
+        "Describe a time you had to collaborate with others to achieve a goal.",
+        "What technical or domain skills do you use most frequently in your work?",
+    ]
+    return base + common_tail
+
+
+def _interview_type_prompt_block(interview_type: str, target_role: str, experience_level: str, target_company: str) -> str:
+    """Human-readable instructions for Gemini based on interview type."""
+    it = (interview_type or "general").lower().strip()
+    blocks = {
+        "general": (
+            "Interview type: General / behavioral interview. Focus on situational and behavioral questions "
+            "that fit the candidate's background (STAR-style scenarios, teamwork, conflict, ownership)."
+        ),
+        "technical": (
+            "Interview type: Technical interview. Include coding-adjacent and engineering depth questions "
+            "(algorithms trade-offs, system design at an appropriate level, debugging, testing, performance) "
+            "aligned with skills implied by the resume."
+        ),
+        "product_management": (
+            "Interview type: Product management. Include strategy, prioritization, metrics, stakeholder management, "
+            "and product sense questions tailored to the candidate's experience."
+        ),
+        "leadership": (
+            "Interview type: Leadership / management. Include people leadership, cross-functional influence, "
+            "coaching, conflict resolution, and org-level scenarios appropriate to the resume."
+        ),
+        "custom": (
+            "Interview type: Custom role-focused interview. Tailor all questions to the candidate's stated "
+            "target role, experience level, and (if provided) target company, using the resume as context."
+        ),
+    }
+    base = blocks.get(it, blocks["general"])
+    if it == "custom":
+        extra = (
+            f"\nCandidate target role: {target_role or 'Not specified'}\n"
+            f"Experience level: {experience_level or 'Not specified'}\n"
+            f"Target company (optional): {target_company or 'Not specified'}\n"
+        )
+        return base + extra
     return base
+
+
+def _build_generate_questions_prompt(
+    resume_text: str,
+    interview_type: str,
+    target_role: str,
+    experience_level: str,
+    target_company: str,
+) -> str:
+    type_block = _interview_type_prompt_block(interview_type, target_role, experience_level, target_company)
+    return (
+        "You are an expert interviewer. " + type_block + "\n\n"
+        "Based on the following resume, generate exactly 10 diverse and challenging interview questions that match "
+        "this interview type and the candidate's background. "
+        "Return only the questions as a numbered list (e.g. 1. First question). No other text.\n\n"
+        "Resume:\n" + resume_text
+    )
 
 
 def _evaluate_answer_with_gemini(question: str, answer_text: str):
@@ -621,11 +714,18 @@ def generate_questions():
     resume_text = data.get('resume_text', '')
     if not resume_text:
         return jsonify({'error': 'No resume text provided'}), 400
+    interview_type = (data.get('interview_type') or 'general').strip().lower()
+    allowed_types = {'general', 'technical', 'product_management', 'leadership', 'custom'}
+    if interview_type not in allowed_types:
+        interview_type = 'general'
+    target_role = (data.get('target_role') or '').strip()
+    experience_level = (data.get('experience_level') or '').strip()
+    target_company = (data.get('target_company') or '').strip()
+
     if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
         return jsonify({'error': 'Gemini API key not configured. Add GEMINI_API_KEY to .env in the project root.'}), 500
-    prompt = (
-        "You are an expert interviewer. Based on the following resume, generate 10 diverse and challenging interview questions. "
-        "Return only the questions as a numbered list (e.g. 1. First question). No other text.\n\nResume:\n" + resume_text
+    prompt = _build_generate_questions_prompt(
+        resume_text, interview_type, target_role, experience_level, target_company
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
@@ -639,12 +739,12 @@ def generate_questions():
         if not response.ok:
             # If the model isn't found or API is misconfigured, fall back to local questions
             err_msg = result.get("error", {}).get("message", result.get("error", response.text))
-            questions = _fallback_questions(resume_text)
+            questions = _fallback_questions(resume_text, interview_type)
             return jsonify({'questions': questions, 'warning': f'Gemini API error (fallback used): {err_msg}'}), 200
 
         questions_text = _extract_gemini_text(result)
         if not questions_text:
-            questions = _fallback_questions(resume_text)
+            questions = _fallback_questions(resume_text, interview_type)
             return jsonify({'questions': questions, 'warning': 'Gemini API returned no text (fallback used).'}), 200
 
         # Split by newlines and strip numbering like "1. " or "1)"
@@ -656,9 +756,9 @@ def generate_questions():
             if q:
                 questions.append(q)
         if not questions:
-            questions = _fallback_questions(resume_text)
+            questions = _fallback_questions(resume_text, interview_type)
             return jsonify({'questions': questions, 'warning': 'Could not parse Gemini response (fallback used).'}), 200
-        return jsonify({'questions': questions})
+        return jsonify({'questions': questions, 'interview_type': interview_type})
     except requests.exceptions.Timeout:
         return jsonify({'error': 'Request to Gemini timed out.'}), 504
     except Exception as e:
