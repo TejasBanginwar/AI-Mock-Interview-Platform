@@ -4,8 +4,11 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Award, ArrowRight } from "lucide-react";
 import { Link } from "react-router-dom";
+import { useAuth } from "@clerk/clerk-react";
+import { buildApiUrl } from "@/lib/api";
 
 const Results = () => {
+  const { getToken } = useAuth();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<string>("");
@@ -26,10 +29,12 @@ const Results = () => {
 
         const sessionId = localStorage.getItem("interviewSessionId");
 
-        const res = await fetch("http://localhost:5000/api/interview-report-transcribe", {
+        const token = await getToken();
+        const res = await fetch(buildApiUrl("/api/interview-report-transcribe"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
           body: JSON.stringify({
             session_id: sessionId || undefined,
@@ -44,15 +49,15 @@ const Results = () => {
           return;
         }
         setReport((data.report || "").trim());
-      } catch (err: any) {
-        setError(err?.message || "Unexpected error while loading results.");
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : "Unexpected error while loading results.");
       } finally {
         setLoading(false);
       }
     };
 
     run();
-  }, []);
+  }, [getToken]);
 
   return (
     <div className="min-h-screen bg-background">

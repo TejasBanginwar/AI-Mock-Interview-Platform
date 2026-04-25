@@ -1,5 +1,7 @@
 import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { useAuth } from "@clerk/clerk-react";
+import { buildApiUrl } from "@/lib/api";
 
 export default function ResumeUpload({
   onParsed,
@@ -9,6 +11,7 @@ export default function ResumeUpload({
   /** When true, user cannot upload (e.g. interview type not chosen yet). */
   disabled?: boolean;
 }) {
+  const { getToken } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,8 +24,10 @@ export default function ResumeUpload({
     const formData = new FormData();
     formData.append("resume", file);
     try {
-      const res = await fetch("http://localhost:5000/api/parse-resume", {
+      const token = await getToken();
+      const res = await fetch(buildApiUrl("/api/parse-resume"), {
         method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         body: formData,
       });
       if (!res.ok) {

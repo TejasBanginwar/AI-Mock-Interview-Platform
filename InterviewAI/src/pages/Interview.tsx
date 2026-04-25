@@ -6,10 +6,13 @@ import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
 import { Mic, MicOff, SkipForward, Check } from "lucide-react";
 import { Link } from "react-router-dom";
+import { useAuth } from "@clerk/clerk-react";
 import { FaceDetectionVideo } from "@/components/FaceDetectionVideo";
 import { TabSwitchWarning } from "@/components/TabSwitchWarning";
+import { buildApiUrl } from "@/lib/api";
 
 const Interview = () => {
+  const { getToken } = useAuth();
   const [isRecording, setIsRecording] = useState(false);
   const [currentQuestion, setCurrentQuestion] = useState(0);
   const [answer, setAnswer] = useState("");
@@ -157,8 +160,10 @@ const Interview = () => {
       formData.append("session_id", getInterviewSessionId());
       formData.append("question_index", String(questionIndex));
 
-      const res = await fetch("http://localhost:5000/api/save-answer-audio", {
+      const token = await getToken();
+      const res = await fetch(buildApiUrl("/api/save-answer-audio"), {
         method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         body: formData,
       });
       const data = await res.json();

@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { useAuth } from "@clerk/clerk-react";
+import { buildApiUrl } from "@/lib/api";
 
 interface Face {
   x: number;
@@ -13,16 +15,19 @@ interface FaceDetectionResult {
   faces: Face[];
   status: 'ok' | 'no_face' | 'multiple_faces';
   warning: string | null;
+  gaze?: 'left' | 'right' | 'center' | null;
 }
 
-const API_URL = 'http://localhost:5000/detect-faces';
+const API_URL = buildApiUrl('/detect-faces');
 
 export const useFaceDetection = () => {
+  const { getToken } = useAuth();
   const [isDetecting, setIsDetecting] = useState(false);
   const [faceCount, setFaceCount] = useState(0);
   const [status, setStatus] = useState<'ok' | 'no_face' | 'multiple_faces'>('ok');
   const [warning, setWarning] = useState<string | null>(null);
   const [faces, setFaces] = useState<Face[]>([]);
+  const [gaze, setGaze] = useState<'left' | 'right' | 'center' | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -52,10 +57,12 @@ export const useFaceDetection = () => {
 
   const detectFaces = useCallback(async (imageData: string) => {
     try {
+      const token = await getToken();
       const response = await fetch(API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         body: JSON.stringify({ image: imageData }),
       });
@@ -69,13 +76,14 @@ export const useFaceDetection = () => {
       setStatus(result.status);
       setWarning(result.warning);
       setFaces(result.faces);
+      setGaze(result.gaze ?? null);
       return result;
     } catch (error) {
       console.error('Face detection error:', error);
       setWarning('Failed to detect faces. Please check if the backend server is running.');
       return null;
     }
-  }, []);
+  }, [getToken]);
 
   const startVideo = useCallback(async () => {
     try {
@@ -192,6 +200,7 @@ export const useFaceDetection = () => {
     status,
     warning,
     faces,
+    gaze,
     startVideo,
     stopVideo,
     startDetection,

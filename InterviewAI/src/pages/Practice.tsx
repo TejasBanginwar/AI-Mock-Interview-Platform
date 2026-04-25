@@ -8,8 +8,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ArrowRight, Briefcase, Check, Code, LineChart, Users } from "lucide-react";
 import { Link } from "react-router-dom";
+import { useAuth } from "@clerk/clerk-react";
 import ResumeUpload from "@/components/ResumeUpload";
 import { cn } from "@/lib/utils";
+import { buildApiUrl } from "@/lib/api";
 
 type InterviewTemplateId =
   | "general"
@@ -58,6 +60,7 @@ const templateLabel = (id: InterviewTemplateId) =>
   TEMPLATE_META.find((t) => t.id === id)?.title ?? id;
 
 const Practice = () => {
+  const { getToken } = useAuth();
   const [tab, setTab] = useState<"template" | "custom">("template");
   const [selectedTemplate, setSelectedTemplate] = useState<InterviewTemplateId | null>(null);
   const [selectedRole, setSelectedRole] = useState("");
@@ -101,10 +104,12 @@ const Practice = () => {
     }
 
     try {
-      const res = await fetch("http://localhost:5000/api/generate-questions", {
+      const token = await getToken();
+      const res = await fetch(buildApiUrl("/api/generate-questions"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         body: JSON.stringify(body),
       });

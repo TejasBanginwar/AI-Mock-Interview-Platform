@@ -309,6 +309,7 @@ def _make_report_from_qa(qa_list):
 
 # Initialize MediaPipe Face Detection
 face_detection = None
+face_mesh = None
 if MEDIAPIPE_AVAILABLE:
     try:
         mp_face_detection = mp.solutions.face_detection
@@ -316,6 +317,15 @@ if MEDIAPIPE_AVAILABLE:
         face_detection = mp_face_detection.FaceDetection(
             model_selection=0,  # 0 for short-range, 1 for full-range
             min_detection_confidence=0.5
+        )
+        # FaceMesh is used for gaze estimation (iris landmarks).
+        mp_face_mesh = mp.solutions.face_mesh
+        face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,  # enables iris landmarks (468-477)
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
         print("MediaPipe Face Detection initialized successfully")
     except Exception as e:
@@ -343,7 +353,7 @@ def decode_base64_image(base64_string):
     return image_array
 
 def process_frame(image_array):
-    """Process a single frame and detect faces"""
+    """Process a single frame and detect faces."""
     if not MEDIAPIPE_AVAILABLE or face_detection is None:
         raise Exception("MediaPipe is not available. Please install it: pip install mediapipe")
     
@@ -374,6 +384,62 @@ def process_frame(image_array):
     
     return faces
 
+
+def _gaze_from_facemesh(face_landmarks, image_w: int, image_h: int):
+    """
+    Estimate gaze direction using iris centers relative to eye corners.
+    Returns "left" | "right" | "center" | None.
+    """
+    if not face_landmarks:
+        return None
+    lm = face_landmarks.landmark
+    try:
+        # Eye corner landmarks (FaceMesh)
+        left_eye = (33, 133)
+        right_eye = (362, 263)
+
+        # Iris landmarks (FaceMesh, when refine_landmarks=True)
+        left_iris_idx = [468, 469, 470, 471, 472]
+        right_iris_idx = [473, 474, 475, 476, 477]
+
+        def _px(i):
+            return float(lm[i].x) * image_w, float(lm[i].y) * image_h
+
+        def _iris_center(idxs):
+            pts = [_px(i) for i in idxs]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            return float(sum(xs) / len(xs)), float(sum(ys) / len(ys))
+
+        def _norm_x(eye_pair, iris_center_x):
+            (x1, _), (x2, _) = _px(eye_pair[0]), _px(eye_pair[1])
+            x_min = min(x1, x2)
+            x_max = max(x1, x2)
+            denom = (x_max - x_min)
+            if denom <= 1e-6:
+                return None
+            return (iris_center_x - x_min) / denom
+
+        lcx, _ = _iris_center(left_iris_idx)
+        rcx, _ = _iris_center(right_iris_idx)
+
+        lpos = _norm_x(left_eye, lcx)
+        rpos = _norm_x(right_eye, rcx)
+
+        vals = [v for v in (lpos, rpos) if v is not None]
+        if not vals:
+            return None
+        pos = float(sum(vals) / len(vals))
+
+        # Stricter thresholds: narrow "center" band to trigger warnings sooner.
+        if pos < 0.47:
+            return "left"
+        if pos > 0.53:
+            return "right"
+        return "center"
+    except Exception:
+        return None
+
 def extract_text_from_pdf(file_stream):
     with pdfplumber.open(file_stream) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
@@ -402,6 +468,19 @@ def detect_faces():
         
         # Process frame
         faces = process_frame(image_array)
+
+        gaze = None
+        try:
+            if MEDIAPIPE_AVAILABLE and face_mesh is not None and len(faces) == 1:
+                # Run FaceMesh on same frame for gaze estimation.
+                image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+                image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+                mesh_res = face_mesh.process(image_rgb)
+                if mesh_res and mesh_res.multi_face_landmarks:
+                    h, w, _ = image_rgb.shape
+                    gaze = _gaze_from_facemesh(mesh_res.multi_face_landmarks[0], w, h)
+        except Exception:
+            gaze = None
         
         # Determine status
         face_count = len(faces)
@@ -421,7 +500,8 @@ def detect_faces():
             'face_count': face_count,
             'faces': faces,
             'status': status,
-            'warning': warning
+            'warning': warning,
+            'gaze': gaze,
         }
         
         return jsonify(response), 200

@@ -2,6 +2,7 @@ import { Button } from "@/components/ui/button";
 import { Link } from "react-router-dom";
 import { Mic, Menu, X } from "lucide-react";
 import { useState } from "react";
+import { SignedIn, SignedOut, SignInButton, UserButton } from "@clerk/clerk-react";
 
 const Navigation = () => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -27,9 +28,21 @@ const Navigation = () => {
             <Link to="/results" className="text-foreground/80 hover:text-foreground transition-colors">
               My Results
             </Link>
-            <Button variant="hero" size="sm">
-              Start Interview
-            </Button>
+            <SignedOut>
+              <SignInButton mode="modal">
+                <Button variant="hero" size="sm">
+                  Sign in
+                </Button>
+              </SignInButton>
+            </SignedOut>
+            <SignedIn>
+              <Link to="/interview">
+                <Button variant="hero" size="sm">
+                  Start Interview
+                </Button>
+              </Link>
+              <UserButton afterSignOutUrl="/" />
+            </SignedIn>
           </div>
 
           <button
@@ -51,9 +64,20 @@ const Navigation = () => {
             <Link to="/results" className="text-foreground/80 hover:text-foreground transition-colors">
               My Results
             </Link>
-            <Button variant="hero" size="sm" className="w-full">
-              Start Interview
-            </Button>
+            <SignedOut>
+              <SignInButton mode="modal">
+                <Button variant="hero" size="sm" className="w-full">
+                  Sign in
+                </Button>
+              </SignInButton>
+            </SignedOut>
+            <SignedIn>
+              <Link to="/interview">
+                <Button variant="hero" size="sm" className="w-full">
+                  Start Interview
+                </Button>
+              </Link>
+            </SignedIn>
           </div>
         )}
       </div>

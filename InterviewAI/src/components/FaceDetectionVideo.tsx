@@ -1,7 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useFaceDetection } from '@/hooks/useFaceDetection';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { AlertCircle, CheckCircle2, Users } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Users, Eye, Monitor } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface FaceDetectionVideoProps {
@@ -18,6 +18,7 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
     status,
     warning,
     faces,
+    gaze,
     startVideo,
     stopVideo,
     startDetection,
@@ -25,6 +26,10 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
   } = useFaceDetection();
 
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const suspiciousStartRef = useRef<number | null>(null);
+  const centerStartRef = useRef<number | null>(null);
+  const warningCooldownUntilRef = useRef<number>(0);
+  const [gazeWarning, setGazeWarning] = useState<string | null>(null);
 
   // Draw face detection overlay
   useEffect(() => {
@@ -83,6 +88,59 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
     }
   }, [autoStart, startVideo, stopVideo, stopDetection]);
 
+  // Sticky gaze warning similar to tab-switch warning UX:
+  // - trigger when suspicious gaze persists > 1.2s
+  // - clear only after stable center gaze for > 1.2s
+  useEffect(() => {
+    const now = Date.now();
+    const okForGaze = status === 'ok' && faceCount === 1;
+    const suspiciousDir: 'left' | 'right' | 'unknown' | null =
+      gaze === 'left' || gaze === 'right' ? gaze : gaze === null ? 'unknown' : null;
+
+    if (!okForGaze) {
+      suspiciousStartRef.current = null;
+      centerStartRef.current = null;
+      setGazeWarning(null);
+      return;
+    }
+
+    if (suspiciousDir) {
+      centerStartRef.current = null;
+      if (suspiciousStartRef.current === null) {
+        suspiciousStartRef.current = now;
+      }
+      if (now - suspiciousStartRef.current >= 1200 && now >= warningCooldownUntilRef.current) {
+        warningCooldownUntilRef.current = now + 2000;
+        if (suspiciousDir === 'left') {
+          setGazeWarning('Please keep your eyes on the screen. Looking left for too long.');
+        } else if (suspiciousDir === 'right') {
+          setGazeWarning('Please keep your eyes on the screen. Looking right for too long.');
+        } else {
+          setGazeWarning('Please keep your full eyes visible and focused on screen.');
+        }
+      }
+      return;
+    }
+
+    // Center gaze: clear warning only after a stable center period.
+    suspiciousStartRef.current = null;
+    if (centerStartRef.current === null) {
+      centerStartRef.current = now;
+    }
+    if (gazeWarning && now - centerStartRef.current >= 1200) {
+      setGazeWarning(null);
+    }
+  }, [gaze, status, faceCount]);
+
+  // Auto-hide warning after 2 seconds (requested behavior).
+  useEffect(() => {
+    if (!gazeWarning) return;
+    const timer = setTimeout(() => {
+      setGazeWarning(null);
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [gazeWarning]);
+
   const getStatusIcon = () => {
     switch (status) {
       case 'ok':
@@ -134,6 +192,13 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
             {status === 'ok' ? 'Face Detected' : status === 'no_face' ? 'No Face' : 'Multiple Faces'}
           </span>
         </div>
+        {status === 'ok' && faceCount === 1 && (
+          <div className="absolute top-4 left-4 px-3 py-1.5 bg-black/70 rounded-lg backdrop-blur-sm">
+            <span className="text-white text-xs font-medium">
+              Gaze: {gaze ?? 'unknown'}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Warning/Status Alert */}
@@ -145,6 +210,27 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
           </AlertTitle>
           <AlertDescription>{warning}</AlertDescription>
         </Alert>
+      )}
+
+      {gazeWarning && (
+        <>
+          <div className="fixed top-0 left-0 right-0 z-50 bg-red-600 text-white px-4 py-3 shadow-lg animate-in slide-in-from-top">
+            <div className="container mx-auto flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Monitor className="h-5 w-5 animate-pulse" />
+                <div>
+                  <p className="font-bold">⚠️ Eye Movement Detected!</p>
+                  <p className="text-sm text-red-100">{gazeWarning}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <Alert variant="destructive" className="border-red-500 bg-red-50 dark:bg-red-950 animate-in slide-in-from-top-5 shadow-lg">
+          <Eye className="h-5 w-5 text-red-600 dark:text-red-400" />
+          <AlertTitle>⚠️ Eye tracking warning</AlertTitle>
+          <AlertDescription>{gazeWarning}</AlertDescription>
+        </Alert>
+        </>
       )}
 
       {!warning && status === 'ok' && faceCount === 1 && (
