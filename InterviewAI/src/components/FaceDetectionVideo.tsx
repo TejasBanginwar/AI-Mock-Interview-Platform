@@ -19,6 +19,7 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
     warning,
     faces,
     gaze,
+    emotion,
     startVideo,
     stopVideo,
     startDetection,
@@ -29,7 +30,16 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
   const suspiciousStartRef = useRef<number | null>(null);
   const centerStartRef = useRef<number | null>(null);
   const warningCooldownUntilRef = useRef<number>(0);
+  const lastEmotionSampleAtRef = useRef<number>(0);
   const [gazeWarning, setGazeWarning] = useState<string | null>(null);
+  const emotionEntries = Object.entries(emotion?.probabilities ?? {}).sort((a, b) => b[1] - a[1]);
+
+  const mapEmotionToBucket = (label: string): "positivity" | "uncomfortable" | "happy" => {
+    const k = label.toLowerCase();
+    if (k === "happy") return "happy";
+    if (["angry", "contempt", "disgust", "fear", "sad"].includes(k)) return "uncomfortable";
+    return "positivity";
+  };
 
   // Draw face detection overlay
   useEffect(() => {
@@ -141,6 +151,44 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
     return () => clearTimeout(timer);
   }, [gazeWarning]);
 
+  // Persist interview emotion counts (sampled) for final pie chart report.
+  useEffect(() => {
+    if (status !== "ok" || faceCount !== 1 || !emotion?.label) return;
+    const now = Date.now();
+    if (now - lastEmotionSampleAtRef.current < 1000) return; // sample at 1 Hz
+    lastEmotionSampleAtRef.current = now;
+
+    const sessionId = localStorage.getItem("interviewSessionId");
+    if (!sessionId) return;
+    const key = `emotionSummary:${sessionId}`;
+
+    try {
+      const raw = localStorage.getItem(key);
+      const parsed = raw ? JSON.parse(raw) : {};
+      const byLabel = typeof parsed?.byLabel === "object" && parsed.byLabel ? parsed.byLabel : {};
+      const byBucket = typeof parsed?.byBucket === "object" && parsed.byBucket ? parsed.byBucket : {};
+
+      const label = emotion.label.toLowerCase();
+      const bucket = mapEmotionToBucket(label);
+
+      byLabel[label] = (Number(byLabel[label]) || 0) + 1;
+      byBucket[bucket] = (Number(byBucket[bucket]) || 0) + 1;
+      const totalSamples = (Number(parsed?.totalSamples) || 0) + 1;
+
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          totalSamples,
+          byLabel,
+          byBucket,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+    } catch {
+      // ignore localStorage parse/write errors
+    }
+  }, [emotion, status, faceCount]);
+
   const getStatusIcon = () => {
     switch (status) {
       case 'ok':
@@ -193,10 +241,14 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
           </span>
         </div>
         {status === 'ok' && faceCount === 1 && (
-          <div className="absolute top-4 left-4 px-3 py-1.5 bg-black/70 rounded-lg backdrop-blur-sm">
-            <span className="text-white text-xs font-medium">
+          <div className="absolute top-4 left-4 px-3 py-1.5 bg-black/70 rounded-lg backdrop-blur-sm space-y-1">
+            <div className="text-white text-xs font-medium">
               Gaze: {gaze ?? 'unknown'}
-            </span>
+            </div>
+            <div className="text-white text-xs font-medium">
+              Emotion: {emotion?.label ?? 'unknown'}
+              {typeof emotion?.confidence === 'number' ? ` (${Math.round(emotion.confidence * 100)}%)` : ''}
+            </div>
           </div>
         )}
       </div>
@@ -238,9 +290,31 @@ export const FaceDetectionVideo = ({ className, autoStart = true }: FaceDetectio
           <CheckCircle2 className="h-5 w-5 text-green-500" />
           <AlertTitle>Face Detection Active</AlertTitle>
           <AlertDescription>
-            Your face is being detected correctly. You can proceed with the interview.
+            Your face is being detected correctly. Current emotion: <strong>{emotion?.label ?? 'unknown'}</strong>.
           </AlertDescription>
         </Alert>
+      )}
+
+      {status === 'ok' && faceCount === 1 && emotionEntries.length > 0 && (
+        <div className="rounded-lg border border-border bg-card p-4">
+          <h4 className="text-sm font-semibold text-card-foreground mb-3">Emotion probabilities (debug)</h4>
+          <div className="space-y-2">
+            {emotionEntries.map(([label, prob]) => (
+              <div key={label} className="space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">{label}</span>
+                  <span className="font-medium text-foreground">{Math.round(prob * 100)}%</span>
+                </div>
+                <div className="h-2 w-full rounded bg-muted overflow-hidden">
+                  <div
+                    className="h-full bg-primary transition-all"
+                    style={{ width: `${Math.max(0, Math.min(100, prob * 100))}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );

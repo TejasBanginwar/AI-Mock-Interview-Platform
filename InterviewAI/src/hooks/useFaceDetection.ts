@@ -16,6 +16,11 @@ interface FaceDetectionResult {
   status: 'ok' | 'no_face' | 'multiple_faces';
   warning: string | null;
   gaze?: 'left' | 'right' | 'center' | null;
+  emotion?: {
+    label: string;
+    confidence: number;
+    probabilities?: Record<string, number>;
+  } | null;
 }
 
 const API_URL = buildApiUrl('/detect-faces');
@@ -28,6 +33,11 @@ export const useFaceDetection = () => {
   const [warning, setWarning] = useState<string | null>(null);
   const [faces, setFaces] = useState<Face[]>([]);
   const [gaze, setGaze] = useState<'left' | 'right' | 'center' | null>(null);
+  const [emotion, setEmotion] = useState<{
+    label: string;
+    confidence: number;
+    probabilities?: Record<string, number>;
+  } | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -77,10 +87,12 @@ export const useFaceDetection = () => {
       setWarning(result.warning);
       setFaces(result.faces);
       setGaze(result.gaze ?? null);
+      setEmotion(result.emotion ?? null);
       return result;
     } catch (error) {
       console.error('Face detection error:', error);
       setWarning('Failed to detect faces. Please check if the backend server is running.');
+      setEmotion(null);
       return null;
     }
   }, [getToken]);
@@ -201,6 +213,7 @@ export const useFaceDetection = () => {
     warning,
     faces,
     gaze,
+    emotion,
     startVideo,
     stopVideo,
     startDetection,

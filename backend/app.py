@@ -16,6 +16,7 @@ import json
 import subprocess
 import uuid
 import shutil
+import pickle
 import docx
 import pdfplumber
 import requests
@@ -40,6 +41,24 @@ except Exception as e:
     print(f"Whisper error: {e}")
     WHISPER_AVAILABLE = False
     whisper_model = None
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except Exception as e:
+    print("WARNING: torch is not available; emotion detection will be skipped.")
+    print(f"torch error: {e}")
+    torch = None
+    TORCH_AVAILABLE = False
+
+try:
+    from torchvision import models as tv_models
+    TORCHVISION_AVAILABLE = True
+except Exception as e:
+    print("WARNING: torchvision is not available; some emotion checkpoints cannot be reconstructed.")
+    print(f"torchvision error: {e}")
+    tv_models = None
+    TORCHVISION_AVAILABLE = False
 
 # Load .env from project root (parent of backend/) when running from backend/
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
@@ -334,6 +353,166 @@ if MEDIAPIPE_AVAILABLE:
 else:
     print("WARNING: MediaPipe is not available. Face detection will not work.")
 
+# Emotion model assets are expected in project root (sibling of backend/)
+_project_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+EMOTION_MODEL_PATH = os.path.join(_project_root, "emotion_model_final.pth")
+EMOTION_CLASSES_PATH = os.path.join(_project_root, "emotion_classes.pkl")
+EMOTION_INPUT_SIZE = int(os.environ.get("EMOTION_INPUT_SIZE", "48"))
+emotion_model = None
+emotion_classes = None
+
+
+def _try_load_emotion_model():
+    """Best-effort loader for PyTorch emotion model and class labels."""
+    global emotion_model, emotion_classes
+    if not TORCH_AVAILABLE:
+        return
+    if not (os.path.isfile(EMOTION_MODEL_PATH) and os.path.isfile(EMOTION_CLASSES_PATH)):
+        print("WARNING: Emotion model files not found; skipping emotion detection init.")
+        return
+
+    try:
+        with open(EMOTION_CLASSES_PATH, "rb") as f:
+            classes = pickle.load(f)
+        if isinstance(classes, (list, tuple)) and len(classes) > 0:
+            emotion_classes = [str(c) for c in classes]
+        else:
+            print("WARNING: emotion_classes.pkl does not contain a non-empty list/tuple.")
+            emotion_classes = None
+    except Exception as e:
+        print(f"WARNING: Failed to load emotion classes: {e}")
+        emotion_classes = None
+        return
+
+    # Try TorchScript first, then regular torch.load.
+    try:
+        model = torch.jit.load(EMOTION_MODEL_PATH, map_location="cpu")
+        model.eval()
+        emotion_model = model
+        print("Emotion model loaded via torch.jit.load")
+        return
+    except Exception:
+        pass
+
+    try:
+        model = torch.load(EMOTION_MODEL_PATH, map_location="cpu")
+        if hasattr(model, "eval"):
+            model.eval()
+        # Direct callable model object.
+        if callable(model):
+            emotion_model = model
+            print("Emotion model loaded via torch.load")
+            return
+
+        # If checkpoint is state_dict, try to reconstruct known backbone.
+        if isinstance(model, dict):
+            state_dict = model
+            keys = list(state_dict.keys())
+            # This checkpoint matches torchvision EfficientNet-B0 style naming.
+            if (
+                TORCHVISION_AVAILABLE
+                and "features.0.0.weight" in state_dict
+                and "classifier.1.1.weight" in state_dict
+            ):
+                n_classes = len(emotion_classes)
+                eff = tv_models.efficientnet_b0(weights=None)
+                # Match classifier output classes.
+                in_features = eff.classifier[1].in_features
+                eff.classifier[1] = torch.nn.Linear(in_features, n_classes)
+
+                remapped = {}
+                for k, v in state_dict.items():
+                    # Saved head is nested as classifier.1.1.*, remap to torchvision classifier.1.*
+                    if k.startswith("classifier.1.1."):
+                        remapped["classifier.1." + k[len("classifier.1.1."):]] = v
+                    else:
+                        remapped[k] = v
+
+                missing, unexpected = eff.load_state_dict(remapped, strict=False)
+                eff.eval()
+                emotion_model = eff
+                print(
+                    "Emotion model reconstructed as EfficientNet-B0 from state_dict "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)})."
+                )
+                return
+
+            print(
+                "WARNING: Loaded emotion state_dict but no supported architecture mapping was found. "
+                "Provide model architecture code to run this checkpoint."
+            )
+            emotion_model = None
+            return
+
+        print("WARNING: Loaded emotion model is not callable and not a supported state_dict.")
+        emotion_model = None
+    except Exception as e:
+        print(f"WARNING: Failed to load emotion model: {e}")
+        emotion_model = None
+
+
+def _predict_emotion_from_face(image_rgb, face_info):
+    """
+    Predict emotion on a detected face crop.
+    Returns {"label": str, "confidence": float, "probabilities": {label: prob}} or None.
+    """
+    if emotion_model is None or emotion_classes is None or not TORCH_AVAILABLE:
+        return None
+    try:
+        h, w, _ = image_rgb.shape
+        x = max(0, int(face_info.get("x", 0)))
+        y = max(0, int(face_info.get("y", 0)))
+        fw = max(1, int(face_info.get("width", 1)))
+        fh = max(1, int(face_info.get("height", 1)))
+        x2 = min(w, x + fw)
+        y2 = min(h, y + fh)
+        if x2 <= x or y2 <= y:
+            return None
+
+        face = image_rgb[y:y2, x:x2]
+        if face.size == 0:
+            return None
+
+        # Checkpoint expects 3-channel input (first conv has 3 input channels).
+        # Use ImageNet-style normalization for EfficientNet-style backbones.
+        rgb = cv2.resize(face, (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        rgb = (rgb - mean) / std
+        chw = np.transpose(rgb, (2, 0, 1))
+        tensor = torch.from_numpy(chw).unsqueeze(0)  # [1,3,224,224]
+
+        with torch.no_grad():
+            out = emotion_model(tensor)
+            if hasattr(out, "logits"):
+                out = out.logits
+            if isinstance(out, (tuple, list)) and len(out) > 0:
+                out = out[0]
+            if out is None:
+                return None
+            if getattr(out, "dim", lambda: 0)() == 1:
+                out = out.unsqueeze(0)
+            probs = torch.softmax(out, dim=1)
+            conf, idx = torch.max(probs, dim=1)
+            ci = int(idx.item())
+            if ci < 0 or ci >= len(emotion_classes):
+                return None
+            probs_np = probs[0].detach().cpu().numpy().tolist()
+            probs_map = {
+                emotion_classes[i]: float(probs_np[i])
+                for i in range(min(len(emotion_classes), len(probs_np)))
+            }
+            return {
+                "label": emotion_classes[ci],
+                "confidence": float(conf.item()),
+                "probabilities": probs_map,
+            }
+    except Exception:
+        return None
+
+
+_try_load_emotion_model()
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 # Default to gemini-2.5-flash, which is the model your quota screenshot shows as having free tier limits.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -470,6 +649,7 @@ def detect_faces():
         faces = process_frame(image_array)
 
         gaze = None
+        emotion = None
         try:
             if MEDIAPIPE_AVAILABLE and face_mesh is not None and len(faces) == 1:
                 # Run FaceMesh on same frame for gaze estimation.
@@ -479,8 +659,11 @@ def detect_faces():
                 if mesh_res and mesh_res.multi_face_landmarks:
                     h, w, _ = image_rgb.shape
                     gaze = _gaze_from_facemesh(mesh_res.multi_face_landmarks[0], w, h)
+                # Emotion detection on the single face crop.
+                emotion = _predict_emotion_from_face(image_rgb, faces[0])
         except Exception:
             gaze = None
+            emotion = None
         
         # Determine status
         face_count = len(faces)
@@ -502,6 +685,7 @@ def detect_faces():
             'status': status,
             'warning': warning,
             'gaze': gaze,
+            'emotion': emotion,
         }
         
         return jsonify(response), 200

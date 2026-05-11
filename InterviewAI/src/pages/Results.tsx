@@ -6,12 +6,30 @@ import { Award, ArrowRight } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useAuth } from "@clerk/clerk-react";
 import { buildApiUrl } from "@/lib/api";
+import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer } from "recharts";
+
+type EmotionSlice = {
+  name: "positivity" | "uncomfortable" | "happy";
+  value: number;
+};
+
+const PIE_COLORS: Record<EmotionSlice["name"], string> = {
+  positivity: "#22c55e",
+  uncomfortable: "#ef4444",
+  happy: "#eab308",
+};
 
 const Results = () => {
   const { getToken } = useAuth();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<string>("");
+  const [emotionData, setEmotionData] = useState<EmotionSlice[]>([
+    { name: "positivity", value: 0 },
+    { name: "uncomfortable", value: 0 },
+    { name: "happy", value: 0 },
+  ]);
+  const [emotionSamples, setEmotionSamples] = useState(0);
 
   useEffect(() => {
     const run = async () => {
@@ -28,6 +46,27 @@ const Results = () => {
         }
 
         const sessionId = localStorage.getItem("interviewSessionId");
+        if (sessionId) {
+          const key = `emotionSummary:${sessionId}`;
+          const raw = localStorage.getItem(key);
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              const bucket = parsed?.byBucket || {};
+              const positivity = Number(bucket.positivity) || 0;
+              const uncomfortable = Number(bucket.uncomfortable) || 0;
+              const happy = Number(bucket.happy) || 0;
+              setEmotionData([
+                { name: "positivity", value: positivity },
+                { name: "uncomfortable", value: uncomfortable },
+                { name: "happy", value: happy },
+              ]);
+              setEmotionSamples(Number(parsed?.totalSamples) || (positivity + uncomfortable + happy));
+            } catch {
+              // ignore malformed emotion summary
+            }
+          }
+        }
 
         const token = await getToken();
         const res = await fetch(buildApiUrl("/api/interview-report-transcribe"), {
@@ -93,6 +132,35 @@ const Results = () => {
                 {report}
               </div>
             )}
+          </Card>
+
+          <Card className="p-8 mb-8 border border-border">
+            <h2 className="text-xl font-semibold text-card-foreground mb-2">Emotion analysis (entire interview)</h2>
+            <p className="text-sm text-muted-foreground mb-4">
+              Pie chart split into positivity, uncomfortable, and happy from webcam emotion samples.
+              {emotionSamples > 0 ? ` Total samples: ${emotionSamples}.` : " No samples captured yet."}
+            </p>
+            <div className="w-full h-[320px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={emotionData}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="50%"
+                    outerRadius={110}
+                    label={({ name, percent }) => `${name}: ${Math.round((percent || 0) * 100)}%`}
+                  >
+                    {emotionData.map((entry) => (
+                      <Cell key={entry.name} fill={PIE_COLORS[entry.name]} />
+                    ))}
+                  </Pie>
+                  <Tooltip formatter={(value: number) => `${value} samples`} />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
           </Card>
 
           <div className="flex flex-col sm:flex-row gap-4">
